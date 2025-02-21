@@ -229,21 +229,14 @@ async function dump() {
         console.error(`Unable to push ${path}`);
       } finally {
         try {
-          fs.rmSync(path, { force: true });
+          fs.rmSync(temp.name, { force: true, recursive: true });
           console.log(
-            `Dump of container ${container.id} has been deleted locally (zip)`
+            `Dump of container ${container.id} has been deleted locally`
           );
         } catch (e) {
           console.error(
             `Unable to delete locally dump of container ${container.id}`
           );
-        } finally {
-          try {
-            temp.removeCallback();
-            console.log(
-              `Dump of container ${container.id} has been deleted locally (temp folder)`
-            );
-          } catch {}
         }
       }
     } catch (e) {
