@@ -43,7 +43,7 @@ const s3 =
 
 // start cron job (run every hour)
 new CronJob(
-  "*/1 * * * *",
+  "*/15 * * * *",
   dump,
   () => {
     console.log(`Dump job has been completed`);
