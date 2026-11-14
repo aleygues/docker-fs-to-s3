@@ -2,6 +2,7 @@ import { exec } from "child_process";
 import { format, subDays } from "date-fns";
 import { CronJob } from "cron";
 import fs from "fs";
+import path from "path";
 import {
   S3Client,
   PutObjectCommand,
@@ -17,6 +18,7 @@ const DUMPS_PATH = process.env.DUMPS_PATH || `/dumps`;
 const DATETIME_FORMAT = "yyyy-MM-dd_HH-mm-ss";
 const DAILY_FORMAT = "yyyy-MM-dd";
 const HOURLY_FORMAT = "yyyy-MM-dd_HH";
+const ROUTINE_FOLDER_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 
 // if needed, we should create the dumps folder
 if (!fs.existsSync(DUMPS_PATH)) {
@@ -49,7 +51,7 @@ new CronJob(
     console.log(`Dump job has been completed`);
   },
   false,
-  "Europe/Paris"
+  "Europe/Paris",
 ).start();
 
 // run a sh command as a Promise, it returns a promise with the output
@@ -68,14 +70,49 @@ function sh(command: string, cwd: string) {
   });
 }
 
+/**
+ * Deletes N-1 (older) routine dump folders in DUMPS_PATH, keeping only the
+ * very previous routine folder in case an unpushed dump needs to be recovered.
+ */
+function cleanupPreviousRoutineFolders() {
+  if (!fs.existsSync(DUMPS_PATH)) {
+    return;
+  }
+
+  const routineFolders = fs
+    .readdirSync(DUMPS_PATH, { withFileTypes: true })
+    .filter(
+      (entry) => entry.isDirectory() && ROUTINE_FOLDER_REGEX.test(entry.name),
+    )
+    .map((entry) => entry.name)
+    .sort();
+
+  const foldersToDelete = routineFolders.slice(0, -1);
+  for (const folder of foldersToDelete) {
+    const folderPath = path.join(DUMPS_PATH, folder);
+    try {
+      fs.rmSync(folderPath, { force: true, recursive: true });
+      console.log(`Old routine dump folder deleted: ${folderPath}`);
+    } catch (e) {
+      console.error(
+        `Unable to delete old routine dump folder: ${folderPath}`,
+        e,
+      );
+    }
+  }
+}
+
 // run the dump routine
 async function dump() {
+  cleanupPreviousRoutineFolders();
+  const routineDumpsPath = path.join(DUMPS_PATH, new Date().toISOString());
+
   // get all containers ids with fr.aleygues.fsdump label
   let containersIds: string[] = [];
   {
     const output = (await sh(
       "docker ps -q -f 'label=fr.aleygues.fsdump'",
-      "."
+      ".",
     )) as string;
     containersIds = output
       .split("\n")
@@ -99,7 +136,7 @@ async function dump() {
   {
     const output = (await sh(
       `docker inspect ${containersIds.join(" ")}`,
-      "."
+      ".",
     )) as string;
     const json = JSON.parse(output);
 
@@ -125,7 +162,7 @@ async function dump() {
         !labels["fr.aleygues.fsdump.prefix"]
       ) {
         console.error(
-          `Container ${container.Id} must have fsdump.prefix label`
+          `Container ${container.Id} must have fsdump.prefix label`,
         );
         continue;
       }
@@ -139,11 +176,11 @@ async function dump() {
       if (
         typeof labels["fr.aleygues.fsdump.frequency"] === "string" &&
         ["daily", "hourly", "weekly"].includes(
-          labels["fr.aleygues.fsdump.frequency"]
+          labels["fr.aleygues.fsdump.frequency"],
         ) === false
       ) {
         console.error(
-          `Container ${container.Id} uses a frequency that does not exist (${labels["fr.aleygues.fsdump.frequency"]})`
+          `Container ${container.Id} uses a frequency that does not exist (${labels["fr.aleygues.fsdump.frequency"]})`,
         );
         continue;
       }
@@ -153,7 +190,7 @@ async function dump() {
         /^[0-9]+$/.test(labels["fr.aleygues.fsdump.daysRetention"]) === false
       ) {
         console.error(
-          `Container ${container.Id} uses an invalid fsdump.daysRetention value`
+          `Container ${container.Id} uses an invalid fsdump.daysRetention value`,
         );
         continue;
       }
@@ -182,67 +219,73 @@ async function dump() {
     // we should check if we need to generate the dump
     const searchKey = `fsdump_${container.prefix}_${format(
       new Date(),
-      container.frequency === "daily" ? DAILY_FORMAT : HOURLY_FORMAT
+      container.frequency === "daily" ? DAILY_FORMAT : HOURLY_FORMAT,
     )}`;
 
     if (remoteDumps.find((dump) => dump.startsWith(searchKey))) {
       continue;
     }
 
+    let temp: tmp.DirResult | undefined;
     try {
-      const path = `/dumps/fsdump_${container.prefix}_${format(
-        new Date(),
-        DATETIME_FORMAT
-      )}.zip`;
-      const temp = tmp.dirSync();
-      await sh(
-        `docker cp ${container.id}:${container.path} ${temp.name} `,
-        "."
+      const dumpPath = path.join(
+        routineDumpsPath,
+        `fsdump_${container.prefix}_${format(new Date(), DATETIME_FORMAT)}.zip`,
       );
-      await sh(`cd ${temp.name} && zip -r ${path} ./`, ".");
+      temp = tmp.dirSync();
+      await sh(
+        `docker cp ${container.id}:${container.path} "${temp.name}" `,
+        ".",
+      );
+      if (!fs.existsSync(routineDumpsPath)) {
+        fs.mkdirSync(routineDumpsPath, { recursive: true });
+      }
+      await sh(`cd "${temp.name}" && zip -r "${dumpPath}" ./`, ".");
       console.log(
-        `Dump of container ${container.id} has been generated, pushing`
+        `Dump of container ${container.id} has been generated, pushing`,
       );
 
       // here we may think it's OK!
       try {
-        await pushDump(path, container.prefix, container.daysRetention);
+        await pushDump(dumpPath, container.prefix, container.daysRetention);
         console.log(
-          `Dump of container ${container.id} has been pushed, cleaning`
+          `Dump of container ${container.id} has been pushed, cleaning`,
         );
 
         try {
           await clearDumps(
             container.prefix,
             container.daysRetention,
-            remoteDumps
+            remoteDumps,
           );
           console.log(
-            `Dumps starting with fsdump_${container.prefix} and older than ${container.daysRetention} days has been deleted`
+            `Dumps starting with fsdump_${container.prefix} and older than ${container.daysRetention} days has been deleted`,
           );
         } catch {
           console.error(
-            `Unable to clean old dumps for prefix ${container.prefix} and days retention of ${container.daysRetention}`
+            `Unable to clean old dumps for prefix ${container.prefix} and days retention of ${container.daysRetention}`,
           );
         }
       } catch {
-        console.error(`Unable to push ${path}`);
-      } finally {
-        try {
-          fs.rmSync(temp.name, { force: true, recursive: true });
-          console.log(
-            `Dump of container ${container.id} has been deleted locally`
-          );
-        } catch (e) {
-          console.error(
-            `Unable to delete locally dump of container ${container.id}`
-          );
-        }
+        console.error(`Unable to push ${dumpPath}`);
       }
     } catch (e) {
       console.debug(`Error is: `, e);
       console.error(`Error dumping container ${container.id}`);
       continue;
+    } finally {
+      if (temp) {
+        try {
+          fs.rmSync(temp.name, { force: true, recursive: true });
+          console.log(
+            `Dump of container ${container.id} has been deleted locally`,
+          );
+        } catch (e) {
+          console.error(
+            `Unable to delete locally dump of container ${container.id}`,
+          );
+        }
+      }
     }
   }
 }
@@ -313,16 +356,16 @@ async function pushDump(path: string, prefix: string, daysRetention: number) {
 async function clearDumps(
   prefix: string,
   daysRetention: number,
-  remoteDumps: string[]
+  remoteDumps: string[],
 ) {
   const fullPrefixWithUnderscore = `fsdump_${prefix}_`;
   const dumps = remoteDumps.filter((dump) =>
-    dump.startsWith(fullPrefixWithUnderscore)
+    dump.startsWith(fullPrefixWithUnderscore),
   );
 
   const minDatetime = `${fullPrefixWithUnderscore}${format(
     subDays(new Date(), daysRetention),
-    DATETIME_FORMAT
+    DATETIME_FORMAT,
   )}.zip`;
 
   const dumpsToDelete = dumps.filter((dump) => dump < minDatetime);
